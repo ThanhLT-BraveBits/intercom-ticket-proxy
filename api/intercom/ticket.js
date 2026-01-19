@@ -1,15 +1,21 @@
 export default async function handler(req, res) {
+  // ===== CORS =====
+  // Cho dev nhanh: allow all. Khi lên production bạn có thể thay "*" bằng domain cụ thể.
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "POST,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+
+  // Preflight request
+  if (req.method === "OPTIONS") {
+    return res.status(204).end();
+  }
+
   if (req.method !== "POST") {
     return res.status(405).json({ error: "Method not allowed" });
   }
 
   try {
-    const {
-      email,
-      store_url,
-      message = "",
-      theme = "Support request"
-    } = req.body || {};
+    const { email, store_url, message = "", theme = "Support request" } = req.body || {};
 
     if (!email || !store_url) {
       return res.status(400).json({
@@ -21,9 +27,17 @@ export default async function handler(req, res) {
     const INTERCOM_TOKEN = process.env.INTERCOM_ACCESS_TOKEN;
     const TICKET_TYPE_ID = process.env.INTERCOM_TICKET_TYPE_ID;
 
-    /* --------------------------------------------------
-     * 1️⃣ UPSERT CONTACT (Lead) – chỉ set store-url
-     * -------------------------------------------------- */
+    if (!INTERCOM_TOKEN || !TICKET_TYPE_ID) {
+      return res.status(500).json({
+        error: "Missing server env",
+        missing: [
+          !INTERCOM_TOKEN ? "INTERCOM_ACCESS_TOKEN" : null,
+          !TICKET_TYPE_ID ? "INTERCOM_TICKET_TYPE_ID" : null
+        ].filter(Boolean)
+      });
+    }
+
+    // 1) Upsert contact (lead) - chỉ set store-url
     const contactRes = await fetch("https://api.intercom.io/contacts", {
       method: "POST",
       headers: {
@@ -51,9 +65,7 @@ export default async function handler(req, res) {
 
     const contactId = contactData.id;
 
-    /* --------------------------------------------------
-     * 2️⃣ CREATE TICKET
-     * -------------------------------------------------- */
+    // 2) Create ticket
     const ticketRes = await fetch("https://api.intercom.io/tickets", {
       method: "POST",
       headers: {
@@ -80,15 +92,11 @@ export default async function handler(req, res) {
       });
     }
 
-    /* --------------------------------------------------
-     * 3️⃣ DONE
-     * -------------------------------------------------- */
     return res.status(200).json({
       ok: true,
       contact_id: contactId,
       ticket_id: ticketData.ticket_id || ticketData.id
     });
-
   } catch (err) {
     return res.status(500).json({
       error: "Unexpected server error",
