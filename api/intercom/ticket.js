@@ -1,97 +1,155 @@
-// api/intercom/tickets.js
+// api/intercom/ticket.js
+
 export default async function handler(req, res) {
-  // --- CORS (để Shopify domain gọi được) ---
-  const origin = req.headers.origin || "*";
-  res.setHeader("Access-Control-Allow-Origin", origin);
+  // ---- CORS (needed for Shopify frontend calling Vercel endpoint)
+  const allowedOrigins = (process.env.ALLOWED_ORIGINS || "")
+    .split(",")
+    .map(s => s.trim())
+    .filter(Boolean);
+
+  const origin = req.headers.origin || "";
+  if (origin && allowedOrigins.length > 0 && !allowedOrigins.includes(origin)) {
+    return res.status(403).json({ error: "Forbidden origin" });
+  }
+
+  res.setHeader("Access-Control-Allow-Origin", origin || "*");
+  res.setHeader("Vary", "Origin");
   res.setHeader("Access-Control-Allow-Methods", "POST,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    "Content-Type, x-api-key"
+  );
 
   if (req.method === "OPTIONS") return res.status(204).end();
-  if (req.method !== "POST") return res.status(405).json({ error: "Method Not Allowed" });
+  if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
+
+  // ---- Optional API key protection
+  // If FORM_API_KEY is set on Vercel, requests must include header: x-api-key: <value>
+  if (process.env.FORM_API_KEY) {
+    const apiKey = req.headers["x-api-key"];
+    if (!apiKey || apiKey !== process.env.FORM_API_KEY) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+  }
+
+  // ---- Required env
+  const token = process.env.INTERCOM_ACCESS_TOKEN;
+  const ticketTypeId = process.env.INTERCOM_TICKET_TYPE_ID;
+  const intercomVersion = process.env.INTERCOM_VERSION || "Unstable";
+
+  if (!token) return res.status(500).json({ error: "Missing INTERCOM_ACCESS_TOKEN" });
+  if (!ticketTypeId) return res.status(500).json({ error: "Missing INTERCOM_TICKET_TYPE_ID" });
+
+  // ---- Parse body (Vercel provides JSON body automatically, but keep safe)
+  const body = typeof req.body === "string" ? safeJsonParse(req.body) : req.body || {};
+
+  const email = String(body.email || "").trim();
+  const store_url = String(body.store_url || "").trim();
+  const collaborator_code = String(body.collaborator_code || "").trim();
+  const theme = String(body.theme || "").trim();
+  const media_link = String(body.media_link || "").trim();
+  const message = String(body.message || "").trim();
+
+  if (!email) return res.status(400).json({ error: "email is required" });
+  if (!store_url) return res.status(400).json({ error: "store_url is required" });
+  if (!message) return res.status(400).json({ error: "message is required" });
 
   try {
-    // Body có thể là object (Vercel parse JSON), hoặc string (tùy client)
-    const body = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
-
-    const {
+    // =========================================================
+    // 1) Upsert Contact (Lead) + set custom_attributes
+    //    => This is what makes fields appear in "Lead data"
+    // =========================================================
+    const contactPayload = {
+      role: "lead",
       email,
-      message,
-      store_url,
-      collaborator_code,
-      theme,
-      media_link
-    } = body || {};
+      custom_attributes: {
+        store_url,
+        theme,
+        collaborator_code,
+        media_link
+      }
+    };
 
-    // --- Validate tối thiểu ---
-    if (!email || !message || !store_url) {
-      return res.status(400).json({
-        error: "Missing required fields",
-        required: ["email", "message", "store_url"]
+    const contactRes = await fetch("https://api.intercom.io/contacts", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+        "Intercom-Version": intercomVersion
+      },
+      body: JSON.stringify(contactPayload)
+    });
+
+    const contactData = await contactRes.json();
+
+    if (!contactRes.ok) {
+      return res.status(contactRes.status).json({
+        error: "Failed to upsert contact",
+        details: contactData
       });
     }
 
-    // --- ENV bắt buộc ---
-    const token = process.env.INTERCOM_ACCESS_TOKEN;
-    const ticketTypeId = process.env.INTERCOM_TICKET_TYPE_ID; // ví dụ: 2763416
-    const intercomVersion = process.env.INTERCOM_VERSION || "Unstable";
+    // =========================================================
+    // 2) Create Ticket and attach the contact by ID
+    // =========================================================
+    const title = `Support request - ${theme || "General"}`;
 
-    if (!token || !ticketTypeId) {
-      return res.status(500).json({
-        error: "Server is not configured",
-        missing: [
-          !token ? "INTERCOM_ACCESS_TOKEN" : null,
-          !ticketTypeId ? "INTERCOM_TICKET_TYPE_ID" : null
-        ].filter(Boolean)
-      });
-    }
-
-    // --- Build ticket description từ form Shopify ---
     const descriptionLines = [
       `Store URL: ${store_url}`,
       `Theme: ${theme || "-"}`,
       `Collaborator code: ${collaborator_code || "-"}`,
       `Video/Screenshot link: ${media_link || "-"}`,
-      ``,
-      `Message:`,
-      `${message}`
+      "",
+      "Message:",
+      message
     ];
 
-    const payload = {
+    const ticketPayload = {
       ticket_type_id: ticketTypeId,
-      contacts: [{ email }],
+      contacts: [{ id: contactData.id }],
       ticket_attributes: {
-        _default_title_: `Support request${theme ? " - " + theme : ""}`,
+        _default_title_: title,
         _default_description_: descriptionLines.join("\n")
       }
     };
 
-    const r = await fetch("https://api.intercom.io/tickets", {
+    const ticketRes = await fetch("https://api.intercom.io/tickets", {
       method: "POST",
       headers: {
-        "Authorization": `Bearer ${token}`,
+        Authorization: `Bearer ${token}`,
         "Content-Type": "application/json",
         "Intercom-Version": intercomVersion
       },
-      body: JSON.stringify(payload)
+      body: JSON.stringify(ticketPayload)
     });
 
-    const data = await r.json();
+    const ticketData = await ticketRes.json();
 
-    if (!r.ok) {
-      return res.status(r.status).json({
-        error: "Intercom API error",
-        status: r.status,
-        details: data
+    if (!ticketRes.ok) {
+      return res.status(ticketRes.status).json({
+        error: "Intercom API error (create ticket)",
+        details: ticketData
       });
     }
 
-    // Trả về ticket id để bạn debug
     return res.status(200).json({
       ok: true,
-      ticket_id: data.ticket_id || data.id,
-      intercom: data
+      contact_id: contactData.id,
+      ticket_id: ticketData.ticket_id || ticketData.id,
+      intercom: ticketData
     });
   } catch (e) {
-    return res.status(500).json({ error: "Unexpected server error", message: String(e?.message || e) });
+    return res.status(500).json({
+      error: "Unexpected server error",
+      message: String(e?.message || e)
+    });
+  }
+}
+
+function safeJsonParse(str) {
+  try {
+    return JSON.parse(str);
+  } catch {
+    return {};
   }
 }
