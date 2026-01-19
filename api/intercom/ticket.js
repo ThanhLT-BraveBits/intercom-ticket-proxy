@@ -1,18 +1,11 @@
 export default async function handler(req, res) {
   // ===== CORS =====
-  // Cho dev nhanh: allow all. Khi lên production bạn có thể thay "*" bằng domain cụ thể.
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 
-  // Preflight request
-  if (req.method === "OPTIONS") {
-    return res.status(204).end();
-  }
-
-  if (req.method !== "POST") {
-    return res.status(405).json({ error: "Method not allowed" });
-  }
+  if (req.method === "OPTIONS") return res.status(204).end();
+  if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
   try {
     const { email, store_url, message = "", theme = "Support request" } = req.body || {};
@@ -20,7 +13,7 @@ export default async function handler(req, res) {
     if (!email || !store_url) {
       return res.status(400).json({
         error: "Missing required fields",
-        required: ["email", "store_url"]
+        required: ["email", "store_url"],
       });
     }
 
@@ -32,26 +25,28 @@ export default async function handler(req, res) {
         error: "Missing server env",
         missing: [
           !INTERCOM_TOKEN ? "INTERCOM_ACCESS_TOKEN" : null,
-          !TICKET_TYPE_ID ? "INTERCOM_TICKET_TYPE_ID" : null
-        ].filter(Boolean)
+          !TICKET_TYPE_ID ? "INTERCOM_TICKET_TYPE_ID" : null,
+        ].filter(Boolean),
       });
     }
 
     // 1) Upsert contact (lead) - chỉ set store-url
+    const contactPayload = {
+      role: "lead",
+      email,
+      custom_attributes: {
+        "store-url": store_url,
+      },
+    };
+
     const contactRes = await fetch("https://api.intercom.io/contacts", {
       method: "POST",
       headers: {
         Authorization: `Bearer ${INTERCOM_TOKEN}`,
         "Content-Type": "application/json",
-        "Intercom-Version": "Unstable"
+        "Intercom-Version": "Unstable",
       },
-      body: JSON.stringify({
-        role: "lead",
-        email,
-        custom_attributes: {
-          "store-url": store_url
-        }
-      })
+      body: JSON.stringify(contactPayload),
     });
 
     const contactData = await contactRes.json();
@@ -59,28 +54,31 @@ export default async function handler(req, res) {
     if (!contactRes.ok) {
       return res.status(contactRes.status).json({
         error: "Failed to upsert contact",
-        details: contactData
+        details: contactData,
+        sent: contactPayload,
       });
     }
 
     const contactId = contactData.id;
 
-    // 2) Create ticket
+    // 2) Create ticket (QUAN TRỌNG: có type: "contact")
+    const ticketPayload = {
+      ticket_type_id: String(TICKET_TYPE_ID),
+      contacts: [{ type: "contact", id: String(contactId) }],
+      ticket_attributes: {
+        _default_title: `Support request - ${theme}`,
+        _default_description: message,
+      },
+    };
+
     const ticketRes = await fetch("https://api.intercom.io/tickets", {
       method: "POST",
       headers: {
         Authorization: `Bearer ${INTERCOM_TOKEN}`,
         "Content-Type": "application/json",
-        "Intercom-Version": "Unstable"
+        "Intercom-Version": "Unstable",
       },
-      body: JSON.stringify({
-        ticket_type_id: TICKET_TYPE_ID,
-        contacts: [{ id: contactId }],
-        ticket_attributes: {
-          _default_title: `Support request - ${theme}`,
-          _default_description: message
-        }
-      })
+      body: JSON.stringify(ticketPayload),
     });
 
     const ticketData = await ticketRes.json();
@@ -88,19 +86,20 @@ export default async function handler(req, res) {
     if (!ticketRes.ok) {
       return res.status(ticketRes.status).json({
         error: "Failed to create ticket",
-        details: ticketData
+        details: ticketData,
+        sent: ticketPayload, // giúp bạn nhìn ra sai field nào
       });
     }
 
     return res.status(200).json({
       ok: true,
       contact_id: contactId,
-      ticket_id: ticketData.ticket_id || ticketData.id
+      ticket_id: ticketData.ticket_id || ticketData.id,
     });
   } catch (err) {
     return res.status(500).json({
       error: "Unexpected server error",
-      message: String(err)
+      message: String(err),
     });
   }
 }
