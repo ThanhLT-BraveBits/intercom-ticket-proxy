@@ -1,7 +1,5 @@
 // api/intercom/ticket.js
-
 export default async function handler(req, res) {
-  // ===== CORS (dev friendly) =====
   const origin = req.headers.origin || "*";
   res.setHeader("Access-Control-Allow-Origin", origin);
   res.setHeader("Vary", "Origin");
@@ -13,31 +11,42 @@ export default async function handler(req, res) {
 
   const INTERCOM_ACCESS_TOKEN = process.env.INTERCOM_ACCESS_TOKEN;
   const INTERCOM_TICKET_TYPE_ID = process.env.INTERCOM_TICKET_TYPE_ID;
+  const INTERCOM_VERSION = process.env.INTERCOM_VERSION || "2.13";
 
-  if (!INTERCOM_ACCESS_TOKEN) {
-    return res.status(500).json({ error: "Missing INTERCOM_ACCESS_TOKEN env" });
-  }
-  if (!INTERCOM_TICKET_TYPE_ID) {
-    return res.status(500).json({ error: "Missing INTERCOM_TICKET_TYPE_ID env" });
-  }
+  if (!INTERCOM_ACCESS_TOKEN) return res.status(500).json({ error: "Missing INTERCOM_ACCESS_TOKEN env" });
+  if (!INTERCOM_TICKET_TYPE_ID) return res.status(500).json({ error: "Missing INTERCOM_TICKET_TYPE_ID env" });
+
+  // Map ticket attribute key (ở Intercom Ticket Type) qua ENV để tránh hardcode sai key
+  // Ví dụ: nếu ticket attribute key của bạn là "store_url" thì set ENV:
+  // TICKET_ATTR_STORE_URL_KEY=store_url
+  const TICKET_ATTR_KEYS = {
+    store_url: process.env.TICKET_ATTR_STORE_URL_KEY,
+    theme: process.env.TICKET_ATTR_THEME_KEY,
+    collaborator_code: process.env.TICKET_ATTR_COLLABORATOR_CODE_KEY,
+    media_link: process.env.TICKET_ATTR_MEDIA_LINK_KEY,
+    message: process.env.TICKET_ATTR_MESSAGE_KEY,
+  };
 
   try {
     const body = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
 
     const email = (body?.email || "").trim();
     const storeUrl = (body?.store_url || "").trim();
+    const collaboratorCode = (body?.collaborator_code || "").trim();
     const theme = (body?.theme || "").trim();
+    const mediaLink = (body?.media_link || "").trim();
+    const message = (body?.message || "").trim();
 
     if (!email) return res.status(400).json({ error: "Missing email" });
     if (!storeUrl) return res.status(400).json({ error: "Missing store_url" });
+    if (!message) return res.status(400).json({ error: "Missing message" });
 
-    // ===== 1) Upsert Contact (Lead data) with ONLY store-url =====
+    // 1) Upsert contact: CHỈ update Lead data field "store-url"
     const upsertPayload = {
       role: "lead",
       email,
       custom_attributes: {
-        // key bạn nói là "store-url"
-        "store-url": storeUrl,
+        "store-url": storeUrl, // <- đúng theo bạn: key contact attribute là store-url
       },
     };
 
@@ -46,7 +55,7 @@ export default async function handler(req, res) {
       headers: {
         Authorization: `Bearer ${INTERCOM_ACCESS_TOKEN}`,
         "Content-Type": "application/json",
-        "Intercom-Version": "2.13",
+        "Intercom-Version": INTERCOM_VERSION,
       },
       body: JSON.stringify(upsertPayload),
     });
@@ -57,23 +66,42 @@ export default async function handler(req, res) {
         error: "Failed to upsert contact",
         details: contactData,
         sent: upsertPayload,
-        hint:
-          "Vào Intercom Settings > Data > People/Contacts > Attributes để kiểm tra key contact attribute có đúng là store-url không.",
       });
     }
 
     const contactId = contactData?.id;
-    if (!contactId) {
-      return res.status(500).json({
-        error: "Upsert contact succeeded but missing contact id",
-        details: contactData,
-      });
-    }
+    if (!contactId) return res.status(500).json({ error: "Missing contact id", details: contactData });
 
-    // ===== 2) Create Ticket =====
-    // LƯU Ý: default keys bắt buộc là _default_title_ và _default_description_
+    // 2) Ticket description: FULL field luôn hiển thị
     const title = theme ? `Support request - ${theme}` : "Support request";
-    const desc = storeUrl; // bạn muốn tạm thời chỉ store url
+
+    const desc = [
+      `Store URL: ${storeUrl}`,
+      `Theme: ${theme || "-"}`,
+      `Collaborator code: ${collaboratorCode || "-"}`,
+      `Video/Screenshot link: ${mediaLink || "-"}`,
+      "",
+      "Message:",
+      message,
+    ].join("\n");
+
+    // 3) Ticket attributes: set theo key đã tạo trên Ticket Type (nếu có ENV key)
+    // Chỉ thêm attribute nếu:
+    // - có key mapping (ENV)
+    // - và có value (không rỗng)
+    const extraTicketAttrs = {};
+    const maybeSet = (envKey, value) => {
+      if (!envKey) return; // chưa cấu hình key => bỏ qua, không gây lỗi
+      const v = (value || "").trim();
+      if (!v) return;
+      extraTicketAttrs[envKey] = v;
+    };
+
+    maybeSet(TICKET_ATTR_KEYS.store_url, storeUrl);
+    maybeSet(TICKET_ATTR_KEYS.theme, theme);
+    maybeSet(TICKET_ATTR_KEYS.collaborator_code, collaboratorCode);
+    maybeSet(TICKET_ATTR_KEYS.media_link, mediaLink);
+    maybeSet(TICKET_ATTR_KEYS.message, message);
 
     const ticketPayload = {
       ticket_type_id: String(INTERCOM_TICKET_TYPE_ID),
@@ -81,6 +109,7 @@ export default async function handler(req, res) {
       ticket_attributes: {
         "_default_title_": title,
         "_default_description_": desc,
+        ...extraTicketAttrs, // <- ticket attributes (nếu key hợp lệ)
       },
     };
 
@@ -89,7 +118,7 @@ export default async function handler(req, res) {
       headers: {
         Authorization: `Bearer ${INTERCOM_ACCESS_TOKEN}`,
         "Content-Type": "application/json",
-        "Intercom-Version": "2.13",
+        "Intercom-Version": INTERCOM_VERSION,
       },
       body: JSON.stringify(ticketPayload),
     });
@@ -100,8 +129,7 @@ export default async function handler(req, res) {
         error: "Failed to create ticket",
         details: ticketData,
         sent: ticketPayload,
-        hint:
-          "Nếu vẫn báo ticket type mismatch, hãy gọi GET /ticket_types để chắc INTERCOM_TICKET_TYPE_ID đúng và ticket type đó có default title/description.",
+        hint: "Nếu lỗi 'Extra attributes...' => bạn đang set ticket attribute key không tồn tại trên Ticket Type. Hãy map đúng key qua ENV TICKET_ATTR_*_KEY.",
       });
     }
 
@@ -109,6 +137,7 @@ export default async function handler(req, res) {
       ok: true,
       contact_id: contactId,
       ticket_id: ticketData?.ticket_id || ticketData?.id,
+      used_ticket_attribute_keys: extraTicketAttrs,
       intercom: ticketData,
     });
   } catch (e) {
